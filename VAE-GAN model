@@ -1,0 +1,457 @@
+import h5py
+import torch
+from torch import nn
+from torch.optim import Adam
+from torch.utils.data import DataLoader, TensorDataset
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as colors
+import os
+import wandb
+
+# wandb.init(project="VAEGAN", entity="02456")
+
+file_path = '/zhome/98/4/202243/02450/magfield_96.h5'
+#file_path = 'D:\\02456DL\\final\\data\\magfield_96.h5'
+
+with h5py.File(file_path, 'r') as hdf:
+    dataset_name = 'field'
+    data = hdf[dataset_name][:]
+
+print(data.shape)
+
+
+# Define the ResidualBlock class
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += identity
+        return self.relu(out)
+
+
+
+class VAE_Encoder(nn.Module):
+    def __init__(self, input_dim, cnum, latent_dim, num_residual_layers):
+        super(VAE_Encoder, self).__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(input_dim[0], cnum, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(cnum),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(cnum, cnum * 2, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(cnum * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(cnum * 2, cnum * 4, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(cnum * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(cnum * 4, cnum * 8, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(cnum * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(cnum * 8, cnum * 16, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(cnum * 16),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.25)
+        )
+
+        conv_output_size = cnum * 16 * 3 * 3  # Adjusted for the new input size
+
+        self.fc_mean = nn.Linear(conv_output_size, latent_dim)
+        self.fc_logvar = nn.Linear(conv_output_size, latent_dim)
+
+    def forward(self, x):
+        x = self.encoder(x)
+        #x = self.residual_layers(x)
+        x = x.view(x.size(0), -1)  # Flatten the output
+        mean = self.fc_mean(x)
+        logvar = self.fc_logvar(x)
+        return mean, logvar
+
+    def reparameterize(self, mean, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mean + eps * std
+
+
+class VAE_Decoder(nn.Module):
+    def __init__(self, input_dim, cnum, latent_dim, num_residual_layers):
+        super(VAE_Decoder, self).__init__()
+
+        H_end = 3
+        W_end = 3  # Adjusted for the new input size
+        self.feature_map_height = H_end
+        self.feature_map_width = W_end
+
+        fc_output_size = cnum * 16 * H_end * W_end
+
+        self.fc = nn.Linear(latent_dim, fc_output_size)
+
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(cnum * 16, cnum * 8, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(cnum * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(cnum * 8, cnum * 4, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(cnum * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(cnum * 4, cnum * 2, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(cnum * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(cnum * 2, cnum, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(cnum),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(cnum, input_dim[0], kernel_size=4, stride=2, padding=1),
+            nn.Tanh()
+        )
+
+    def forward(self, z):
+        z = self.fc(z)
+        z = z.view(-1, cnum * 16, self.feature_map_height, self.feature_map_width)
+        #z = self.residual_layers(z)
+        reconstruction = self.decoder(z)
+        return reconstruction
+
+"""
+class VAE_GAN_Discriminator(nn.Module):
+
+    def __init__(self, input_channels, feature_map_size, number_of_features):
+        super(VAE_GAN_Discriminator, self).__init__()
+
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(input_channels, feature_map_size, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(feature_map_size, feature_map_size * 2, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(feature_map_size * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(feature_map_size * 2, feature_map_size * 4, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(feature_map_size * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(feature_map_size * 4, feature_map_size * 8, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(feature_map_size * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+           # nn.Conv2d(feature_map_size * 8, feature_map_size * 8, kernel_size=4, stride=2, padding=1),  # 新增的额外下采样层
+        )
+
+
+
+        self.classifier = nn.Sequential(
+            nn.Conv2d(feature_map_size * 4, 1, kernel_size=4, stride=1, padding=0),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.feature_extractor(x)
+        x = self.classifier(x)
+        return x.view(-1)
+"""
+
+class VAE_GAN_Discriminator(nn.Module):
+    def __init__(self, input_channels, feature_map_size):
+        super(VAE_GAN_Discriminator, self).__init__()
+
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(input_channels, feature_map_size, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(feature_map_size, feature_map_size * 2, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(feature_map_size * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(feature_map_size * 2, feature_map_size * 4, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(feature_map_size * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Conv2d(feature_map_size * 4, 1, kernel_size=(12, 12)),  # 调整卷积核尺寸以匹配最终特征图的尺寸
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.feature_extractor(x)
+        x = self.classifier(x)
+        return x.view(-1, 1)  # 确保输出尺寸为 [batch_size, 1]
+
+input_channels = 3
+feature_map_size = 64
+number_of_features = 32
+
+
+#-----------------loss function-----------------------
+# MSE
+def mse_loss(recon_x, x):
+    return F.mse_loss(recon_x, x, reduction='mean')
+
+# KL
+def kl_divergence_loss(mu, logvar):
+    return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / mu.numel()
+
+def calculate_relative_error(pred, target):
+    relative_error = torch.norm(pred - target, dim=1) / (torch.norm(target, dim=1) + 1e-6)
+    return torch.median(relative_error) * 100
+
+# discriminator_loss
+def discriminator_loss(real_data, fake_data, discriminator):
+    real_labels = torch.ones(real_data.size(0), 1).to(device)
+    fake_labels = torch.zeros(fake_data.size(0), 1).to(device)
+
+    real_predictions = discriminator(real_data)
+    real_loss = F.binary_cross_entropy(real_predictions, real_labels)
+
+    fake_predictions = discriminator(fake_data)
+    fake_loss = F.binary_cross_entropy(fake_predictions, fake_labels)
+
+    total_loss = real_loss + fake_loss
+    return total_loss
+
+
+"""
+#-----------Visualizing reconstruction loss and KL divergence plots---
+def plot_loss(reconstruction_loss, kl_loss, epochs):
+    plt.figure(figsize=(10, 5))
+    plt.title("Reconstruction Loss and KL Divergence Over Epochs")
+    plt.plot(range(epochs), reconstruction_loss, color='blue', label='Reconstruction Loss')
+    plt.plot(range(epochs), kl_loss, color='red', label='KL Divergence')
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f'loss_plot_up_to_epoch_{epochs}.png')
+    plt.xticks(range(0, epochs + 1, 100))  # 设置x轴刻度为0, 100, 200, ... 到500
+    plt.close()
+"""
+
+#-----------Visualizing the median relative error graph----------
+def plot_relative_error(all_median_errors, epochs, lambda_values):
+    plt.figure(figsize=(10, 5))
+    plt.title("Median Relative Error Over Epochs for Different λ Values")
+    for median_errors, lambda_val in zip(all_median_errors, lambda_values):
+        plt.plot(range(epochs), median_errors, label=f'λ={lambda_val}')
+    plt.xlabel("Epochs")
+    plt.ylabel("Relative Error (%)")
+    plt.legend()
+    plt.grid(True)
+    plt.xticks(range(0, epochs + 1, 50))
+    plt.savefig(f'relative_error_plot_diff_lambda.png')
+    plt.close()
+
+
+"""
+def plot_combined_loss(reconstruction_loss, kl_loss, relative_error, epochs,lambda_value):
+    plt.figure(figsize=(10, 5))
+    plt.title(f"Loss and Median Error Trends at λ={lambda_value}")
+
+    plt.plot(range(epochs), reconstruction_loss, color='blue', label='Reconstruction Loss')
+
+    plt.plot(range(epochs), kl_loss, color='red', label='KL Divergence')
+
+    plt.plot(range(epochs), relative_error, color='green', label='Median Relative Error')
+
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss/Relative Error")
+    plt.legend()
+    plt.grid(True)
+    plt.xticks(range(0, epochs + 1, 50))  # 设置x轴刻度为0, 50, 100, ... 到最大epoch
+    plt.savefig(f'combined_loss_plot_up_to_epoch_{epochs}.png')
+    plt.close()
+"""
+
+
+input_dim = (3, 96, 96)
+cnum = 64
+latent_dim = 128
+num_residual_layers = 2
+
+data = (data - data.min()) / (data.max() - data.min()) * 2 - 1
+train_data, test_data = train_test_split(data, test_size=1/3, random_state=42)
+
+
+epochs = 250
+learning_rate = 1e-4
+batch_size = 60
+
+train_tensor = torch.from_numpy(train_data).float()
+test_tensor = torch.from_numpy(test_data).float()
+
+
+train_dataset = TensorDataset(train_tensor)
+train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True)
+test_dataset = TensorDataset(test_tensor)
+test_loader = DataLoader(dataset=test_dataset, batch_size=batch_size, shuffle=False)
+
+
+encoder = VAE_Encoder(input_dim, cnum, latent_dim, num_residual_layers)
+decoder = VAE_Decoder(input_dim, cnum, latent_dim, num_residual_layers)
+discriminator = VAE_GAN_Discriminator(input_channels, feature_map_size)
+
+params = list(encoder.parameters()) + list(decoder.parameters())
+optimizer = Adam(params, lr=learning_rate)
+discriminator_optimizer = Adam(discriminator.parameters(), lr=learning_rate)
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+encoder.to(device)
+decoder.to(device)
+discriminator.to(device)
+
+#Initialize the list before the training loop
+reconstruction_losses = []
+kl_divergences = []
+median_errors = []
+
+lambda_values = [0.1, 0.5, 1.0, 2.0]
+all_median_errors = []
+
+for lambda_value in lambda_values:
+    reconstruction_losses = []
+    kl_divergences = []
+    median_errors = []
+
+    #-------------------train--------------
+    for epoch in range(epochs):
+        encoder.train()
+        decoder.train()
+        discriminator.train()
+
+        train_loss = 0.0
+        recon_loss = 0.0
+        kl_loss = 0.0
+        rmse_loss = 0.0
+        mae_loss = 0.0
+        test_rmse_loss = 0.0
+        test_mae_loss = 0.0
+
+        for batch_idx, (data,) in enumerate(train_loader):
+            data = data.to(device)
+
+            optimizer.zero_grad()
+            discriminator_optimizer.zero_grad()
+
+            mu, logvar = encoder(data)
+            z = encoder.reparameterize(mu, logvar)
+            recon_data = decoder(z)
+
+            recon = mse_loss(recon_data, data)
+            kl_div = kl_divergence_loss(mu, logvar)
+            vae_loss = recon + 0.05*kl_div
+
+            d_loss = lambda_value * discriminator_loss(data, recon_data.detach(), discriminator)
+            total_loss = vae_loss + d_loss
+
+
+            total_loss.backward()
+
+
+            optimizer.step()
+            discriminator_optimizer.step()
+
+            train_loss += vae_loss.item()
+            recon_loss += recon.item()
+            kl_loss += kl_div.item()
+
+            rmse = torch.sqrt(torch.mean((recon_data - data) ** 2))
+            mae = torch.mean(torch.abs(recon_data - data))
+
+            rmse_loss += rmse.item()
+            mae_loss += mae.item()
+
+        # 训练循环结束后收集重建损失和KL散度 更新列表
+        avg_train_loss = train_loss / len(train_loader)
+        avg_recon_loss = recon_loss / len(train_loader.dataset)
+        avg_kl_loss = kl_loss / len(train_loader.dataset)
+        reconstruction_losses.append(avg_recon_loss)
+        kl_divergences.append(avg_kl_loss)
+
+
+    #--------------------test----------------------------
+        encoder.eval()
+        decoder.eval()
+        discriminator.eval()
+
+        errors = []
+        real_scores = []
+        fake_scores = []
+
+        with torch.no_grad():
+            for batch in test_loader:
+                input_data = batch[0].to(device)
+
+                mu, logvar = encoder(input_data)
+                z = encoder.reparameterize(mu, logvar)
+                recon_data = decoder(z)
+
+                error = calculate_relative_error(recon_data, input_data)
+                errors.append(error.item())
+
+                real_score = discriminator(input_data)
+                fake_score = discriminator(recon_data)
+                real_scores.append(real_score.mean().item())
+                fake_scores.append(fake_score.mean().item())
+
+                test_rmse = torch.sqrt(torch.mean((recon_data - input_data) ** 2))
+                test_mae = torch.mean(torch.abs(recon_data - input_data))
+
+                test_rmse_loss += test_rmse.item()
+                test_mae_loss += test_mae.item()
+
+
+        median_error = np.median(errors)
+        median_errors.append(median_error)
+
+        avg_test_rmse = test_rmse_loss / len(test_loader)
+        avg_test_mae = test_mae_loss / len(test_loader)
+        median_error = np.median(errors)
+        avg_real_score = np.mean(real_scores)
+        avg_fake_score = np.mean(fake_scores)
+
+        avg_rmse = rmse_loss / len(train_loader)
+        avg_mae = mae_loss / len(train_loader)
+
+
+
+        with open('training_output.txt', 'a') as f:
+            f.write('Epoch {}, λ={}, '.format(epoch, lambda_value) +
+                    'Loss: {}, '.format(train_loss / len(train_loader)) +
+                    'Reconstruction Loss: {}, '.format(recon_loss / len(train_loader)) +
+                    'KL Divergence Loss: {}, '.format(kl_loss / len(train_loader)) +
+                    'Median Relative Error on Test Set: {}%, '.format(median_error) +
+                    'Average RMSE: {}, '.format(avg_rmse) +
+                    'Average MAE: {}, '.format(avg_mae) +
+                    'Average RMSE on Test Set: {}, '.format(avg_test_rmse) +
+                    'Average MAE on Test Set: {}, '.format(avg_test_mae) +
+                    'Average Discriminator Score for Real Images: {}, '.format(avg_real_score) +
+                    'Average Discriminator Score for Fake Images: {}\n'.format(avg_fake_score))
+
+
+        print('Epoch {}, λ={}, '.format(epoch, lambda_value) +
+              'Loss: {}, '.format(train_loss / len(train_loader.dataset)) +
+              'Reconstruction Loss: {}, '.format(recon_loss / len(train_loader.dataset)) +
+              'KL Divergence Loss: {}, '.format(kl_loss / len(train_loader.dataset)) +
+              'Median Relative Error on Test Set: {}%, '.format(median_error) +
+              'Average RMSE: {}, '.format(avg_rmse) +
+              'Average MAE: {}, '.format(avg_mae) +
+              'Average RMSE on Test Set: {}, '.format(avg_test_rmse) +
+              'Average MAE on Test Set: {}, '.format(avg_test_mae) +
+              'Average Discriminator Score for Real Images: {}, '.format(avg_real_score) +
+              'Average Discriminator Score for Fake Images: {}'.format(avg_fake_score))
+
+    all_median_errors.append(median_errors)
+
+
+# plot_loss(reconstruction_losses, kl_divergences, epochs)
+plot_relative_error(all_median_errors, epochs, lambda_values)
